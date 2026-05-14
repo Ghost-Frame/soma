@@ -353,3 +353,17 @@ Returns aggregate counts.
   "logs": 4201
 }
 ```
+
+---
+
+## Where Soma Fits
+
+Soma is one piece of a larger agent infrastructure. Sister services:
+
+- [axon](https://github.com/Ghost-Frame/axon) -- pub/sub event bus
+- [broca](https://github.com/Ghost-Frame/broca) -- action log and natural language narrator
+- [chiasm](https://github.com/Ghost-Frame/chiasm) -- task coordination dashboard
+- [loom](https://github.com/Ghost-Frame/loom) -- workflow orchestration
+- [thymus](https://github.com/Ghost-Frame/thymus) -- output evaluation and quality scoring
+
+Soma runs standalone -- any agent can register, heartbeat, and be discovered by capability -- and is the source of truth for which agents exist in your system.
