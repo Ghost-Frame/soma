@@ -1,6 +1,6 @@
 # Soma
 
-Soma is an agent registry service. It tracks which agents are running in a system, their capabilities, health status, and group membership. Agents register on startup, send periodic heartbeats to stay marked online, and deregister on shutdown. Other services query Soma to discover agents by capability or status.
+Soma is an agent registry. Agents register on startup, send periodic heartbeats, and other services query Soma to find which agents are running, what they can do, and when they were last seen. Soma does not police liveness for you. Heartbeats update a timestamp; you decide what "stale" means by querying `/agents/stale` against your own window.
 
 - **Port:** 4800
 - **Stack:** Node 22, libsql (SQLite-compatible embedded database)
@@ -10,11 +10,11 @@ Soma is an agent registry service. It tracks which agents are running in a syste
 
 ## What It Does
 
-- Maintains a live registry of all agents in the system
-- Marks agents offline automatically when heartbeats stop
+- Stores agents with `name`, `type`, capabilities, and free-form config
+- Records heartbeat timestamps and exposes stale-agent queries
 - Groups agents into named collections for coordinated work
 - Indexes agents by capability for capability-based discovery
-- Stores per-agent logs and exposes aggregate stats
+- Stores per-agent logs and emits register/deregister events to Axon
 
 ---
 
@@ -30,19 +30,33 @@ docker run -d \
   ghcr.io/ghost-frame/soma:latest
 ```
 
-Without `SOMA_AUTH=disabled`, all write endpoints require `Authorization: Bearer <SOMA_API_KEY>`.
+Without `SOMA_AUTH=disabled`, every endpoint except `/health` requires `Authorization: Bearer <SOMA_API_KEY>`.
 
 ---
 
 ## Environment Variables
 
-| Variable           | Default     | Description                                                        |
-|--------------------|-------------|--------------------------------------------------------------------|
-| `PORT`             | `4800`      | Port to listen on                                                  |
-| `DB_PATH`          | `soma.db`   | Path to the libsql database file                                   |
-| `SOMA_API_KEY`     | (none)      | Bearer token required for authenticated requests                   |
-| `SOMA_AUTH`        | (required)  | Set to `disabled` to skip auth entirely (development only)         |
-| `CORS_ALLOW_ORIGIN`| `*`         | Value for the `Access-Control-Allow-Origin` response header        |
+| Variable            | Default     | Description                                                        |
+|---------------------|-------------|--------------------------------------------------------------------|
+| `PORT`              | `4800`      | Port to listen on                                                  |
+| `HOST`              | `0.0.0.0`   | Bind address                                                       |
+| `DB_PATH`           | `soma.db`   | Path to the libsql database file                                   |
+| `SOMA_API_KEY`      | (none)      | Bearer token required for authenticated requests                   |
+| `SOMA_AUTH`         | (required)  | Set to `disabled` to skip auth entirely (development only)         |
+| `CORS_ALLOW_ORIGIN` | (none)      | Value for the `Access-Control-Allow-Origin` response header        |
+| `BODY_MAX_BYTES`    | `65536`     | Maximum request body size                                          |
+| `AXON_URL`          | (none)      | Axon endpoint to publish lifecycle events to                       |
+| `AXON_API_KEY`      | (none)      | Bearer token for Axon publishes                                    |
+
+---
+
+## Concepts
+
+- **Agent** -- a registered participant with `name`, `type`, optional `description`, `capabilities` array, and free-form `config`. Has a `status` (default `online`) and a `heartbeat_at` timestamp.
+- **Heartbeat** -- a POST that updates `heartbeat_at` and, by default, sets status back to `online`. Pass an explicit `status` to set it to something else (`offline`, `degraded`, anything you want).
+- **Stale** -- an agent whose `status` is still `online` but whose last heartbeat is older than your chosen window. Soma exposes this via `GET /agents/stale?minutes=N`. Soma does not automatically transition stale agents to `offline` -- run a sweeper if you want that behavior.
+- **Group** -- a named collection of agents. Membership is many-to-many.
+- **Capability** -- a string in an agent's `capabilities` array. Lookup is exact-match.
 
 ---
 
@@ -52,10 +66,18 @@ Without `SOMA_AUTH=disabled`, all write endpoints require `Authorization: Bearer
 
 #### `GET /health`
 
-Returns service status.
+Always open. Returns version and live counts.
 
 ```json
-{ "status": "ok" }
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "agents": 12,
+  "online": 8,
+  "groups": 3,
+  "by_type": [{ "type": "reviewer", "count": 5 }],
+  "by_status": [{ "status": "online", "count": 8 }]
+}
 ```
 
 ---
@@ -64,30 +86,34 @@ Returns service status.
 
 #### `POST /agents`
 
-Register a new agent.
+Register an agent.
 
 **Request**
 ```json
 {
-  "name": "code-reviewer",
+  "name": "code-reviewer-01",
+  "type": "reviewer",
+  "description": "TypeScript code reviewer",
   "capabilities": ["code-review", "typescript"],
-  "metadata": {
-    "version": "1.0.0",
-    "host": "worker-01"
-  }
+  "config": { "model": "claude-sonnet-4-6", "host": "worker-01" }
 }
 ```
+
+`name` and `type` are required. `description`, `capabilities`, and `config` are optional. Names are unique -- duplicate registrations return `409`.
 
 **Response** `201`
 ```json
 {
-  "id": "ag_01j9xyz",
-  "name": "code-reviewer",
-  "status": "online",
+  "id": 1,
+  "name": "code-reviewer-01",
+  "type": "reviewer",
+  "description": "TypeScript code reviewer",
   "capabilities": ["code-review", "typescript"],
-  "metadata": { "version": "1.0.0", "host": "worker-01" },
+  "config": { "model": "claude-sonnet-4-6", "host": "worker-01" },
+  "status": "online",
+  "heartbeat_at": "2026-03-22T12:00:00Z",
   "created_at": "2026-03-22T12:00:00Z",
-  "last_seen": "2026-03-22T12:00:00Z"
+  "updated_at": "2026-03-22T12:00:00Z"
 }
 ```
 
@@ -95,123 +121,87 @@ Register a new agent.
 
 #### `GET /agents`
 
-List all agents. Filter by status with `?status=online`.
+List agents.
 
 **Query params**
-- `status` - filter by status (`online`, `offline`)
+- `type` -- filter by type
+- `status` -- filter by status
+- `capability` -- filter to agents whose `capabilities` array contains this string (exact match)
+- `limit` -- default `100`, max `500`
 
-**Response** `200`
-```json
-[
-  {
-    "id": "ag_01j9xyz",
-    "name": "code-reviewer",
-    "status": "online",
-    "capabilities": ["code-review", "typescript"],
-    "last_seen": "2026-03-22T12:00:00Z"
-  }
-]
+---
+
+#### `GET /agents/stale`
+
+List agents whose `status` is `online` but whose last heartbeat is older than the window.
+
+**Query params**
+- `minutes` -- staleness threshold in minutes, default `5`, max `1440`
+
+---
+
+#### `GET /agents/capability/:name`
+
+Find every agent that declares the named capability. URL-decoded path param.
+
+**Example**
+```
+GET /agents/capability/code-review
 ```
 
 ---
 
 #### `GET /agents/:id`
 
-Get a single agent by ID.
-
-**Response** `200`
-```json
-{
-  "id": "ag_01j9xyz",
-  "name": "code-reviewer",
-  "status": "online",
-  "capabilities": ["code-review", "typescript"],
-  "metadata": { "version": "1.0.0" },
-  "created_at": "2026-03-22T12:00:00Z",
-  "last_seen": "2026-03-22T12:00:00Z"
-}
-```
-
----
+Get one agent.
 
 #### `PATCH /agents/:id`
 
-Update an agent's name, capabilities, or metadata.
-
-**Request**
-```json
-{
-  "capabilities": ["code-review", "typescript", "go"],
-  "metadata": { "version": "1.1.0" }
-}
-```
-
-**Response** `200` - updated agent object
-
----
+Update `name`, `type`, `description`, `capabilities`, `config`, or `status`. Other fields are ignored.
 
 #### `DELETE /agents/:id`
 
-Deregister an agent.
-
-**Response** `200`
-```json
-{ "ok": true }
-```
+Deregister an agent. Cascades to the agent's logs and group memberships.
 
 ---
 
 #### `POST /agents/:id/heartbeat`
 
-Send a heartbeat to keep the agent marked online. Call this on a regular interval (e.g., every 30 seconds).
+Update `heartbeat_at` for the agent and refresh status. The body is optional.
 
-**Response** `200`
+**Request** (optional)
 ```json
-{ "ok": true, "last_seen": "2026-03-22T12:01:00Z" }
+{ "status": "degraded" }
 ```
+
+If `status` is omitted, the agent's status is set to `online`. Otherwise it is set to the supplied string.
+
+**Response** `200` -- the updated agent.
+
+---
+
+#### `POST /agents/:id/logs`
+
+Add a log entry for the agent.
+
+**Request**
+```json
+{ "level": "info", "message": "Started batch", "data": { "batch_size": 12 } }
+```
+
+`message` is required. `level` defaults to `info`. `data` is optional and stored as JSON.
+
+**Response** `201` -- the stored log row.
 
 ---
 
 #### `GET /agents/:id/logs`
 
-Get logs for a specific agent.
+Get the agent's logs, newest first.
 
-**Response** `200`
-```json
-[
-  {
-    "id": "log_abc",
-    "agent_id": "ag_01j9xyz",
-    "level": "info",
-    "message": "Started processing task batch",
-    "created_at": "2026-03-22T12:00:30Z"
-  }
-]
-```
-
----
-
-### Logs
-
-#### `POST /logs`
-
-Add a log entry for an agent.
-
-**Request**
-```json
-{
-  "agent_id": "ag_01j9xyz",
-  "level": "info",
-  "message": "Started processing task batch"
-}
-```
-
-Accepted levels: `debug`, `info`, `warn`, `error`
-
-**Response** `201`
-```json
-{ "id": "log_abc", "ok": true }
-```
+**Query params**
+- `level` -- filter by level
+- `limit` -- default `100`, max `1000`
 
 ---
 
@@ -223,118 +213,33 @@ Create a group.
 
 **Request**
 ```json
-{
-  "name": "reviewers",
-  "description": "Agents assigned to code review tasks"
-}
+{ "name": "reviewers", "description": "Agents assigned to code review" }
 ```
 
-**Response** `201`
-```json
-{
-  "id": "grp_01",
-  "name": "reviewers",
-  "description": "Agents assigned to code review tasks",
-  "created_at": "2026-03-22T12:00:00Z"
-}
-```
+`name` is required. Returns `409` if the name already exists.
 
 ---
 
 #### `GET /groups`
 
-List all groups.
+List every group.
 
-**Response** `200`
-```json
-[
-  { "id": "grp_01", "name": "reviewers", "member_count": 3 }
-]
-```
+#### `GET /groups/:id/members`
 
----
-
-#### `GET /groups/:id`
-
-Get a group and its members.
-
-**Response** `200`
-```json
-{
-  "id": "grp_01",
-  "name": "reviewers",
-  "description": "Agents assigned to code review tasks",
-  "members": [
-    { "id": "ag_01j9xyz", "name": "code-reviewer", "status": "online" }
-  ]
-}
-```
-
----
-
-#### `DELETE /groups/:id`
-
-Delete a group. Does not delete member agents.
-
-**Response** `200`
-```json
-{ "ok": true }
-```
-
----
+List the agents in a group.
 
 #### `POST /groups/:id/members`
 
-Add an agent to a group.
+Add an agent to the group.
 
 **Request**
 ```json
-{ "agent_id": "ag_01j9xyz" }
+{ "agent_id": 1 }
 ```
 
-**Response** `200`
-```json
-{ "ok": true }
-```
+#### `DELETE /groups/:id/members/:agentId`
 
----
-
-#### `DELETE /groups/:id/members/:agent_id`
-
-Remove an agent from a group.
-
-**Response** `200`
-```json
-{ "ok": true }
-```
-
----
-
-### Capabilities
-
-#### `GET /capabilities`
-
-Find agents by capability. Requires `?capability=` query param.
-
-**Query params**
-- `capability` (required) - capability name to search for
-
-**Example**
-```
-GET /capabilities?capability=code-review
-```
-
-**Response** `200`
-```json
-[
-  {
-    "id": "ag_01j9xyz",
-    "name": "code-reviewer",
-    "status": "online",
-    "capabilities": ["code-review", "typescript"]
-  }
-]
-```
+Remove the agent from the group.
 
 ---
 
@@ -342,17 +247,28 @@ GET /capabilities?capability=code-review
 
 #### `GET /stats`
 
-Returns aggregate counts.
-
-**Response** `200`
 ```json
 {
-  "agents_total": 12,
-  "agents_online": 8,
+  "agents": 12,
+  "online": 8,
   "groups": 3,
-  "logs": 4201
+  "by_type":   [{ "type": "reviewer", "count": 5 }, { "type": "watcher", "count": 7 }],
+  "by_status": [{ "status": "online", "count": 8 }, { "status": "offline", "count": 4 }]
 }
 ```
+
+---
+
+## Events
+
+Soma publishes two event types to Axon, with `source: "soma"`:
+
+| Channel  | Type                  | Emitted when               |
+|----------|-----------------------|----------------------------|
+| `system` | `agent.registered`    | An agent is registered     |
+| `system` | `agent.deregistered`  | An agent is deleted        |
+
+Heartbeats and status changes do not emit events.
 
 ---
 
@@ -366,4 +282,4 @@ Soma is one piece of a larger agent infrastructure. Sister services:
 - [loom](https://github.com/Ghost-Frame/loom) -- workflow orchestration
 - [thymus](https://github.com/Ghost-Frame/thymus) -- output evaluation and quality scoring
 
-Soma runs standalone -- any agent can register, heartbeat, and be discovered by capability -- and is the source of truth for which agents exist in your system.
+Soma runs standalone. Any agent can register, heartbeat, and be discovered by capability. Use it as the source of truth for which agents exist in your system, and pair it with a sweeper job hitting `/agents/stale` if you want automatic status transitions.
