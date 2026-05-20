@@ -4,7 +4,6 @@ Soma is an agent registry. Agents register on startup, send periodic heartbeats,
 
 - **Port:** 4800
 - **Stack:** Node 22, libsql (SQLite-compatible embedded database)
-- **Org:** [Ghost-Frame/soma](https://github.com/Ghost-Frame/soma)
 
 ---
 
