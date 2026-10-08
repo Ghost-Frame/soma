@@ -282,3 +282,7 @@ Soma is one piece of a larger agent infrastructure. Sister services:
 - [thymus](https://github.com/Ghost-Frame/thymus) -- output evaluation and quality scoring
 
 Soma runs standalone. Any agent can register, heartbeat, and be discovered by capability. Use it as the source of truth for which agents exist in your system, and pair it with a sweeper job hitting `/agents/stale` if you want automatic status transitions.
+
+## License
+
+[PolyForm Noncommercial License 1.0.0](LICENSE). Personal, hobby, research, and other noncommercial use is permitted. Any commercial use, including selling, reselling, hosting, bundling, or otherwise earning revenue from this software, requires a separate written commercial license. Contact support@syntheos.dev.
